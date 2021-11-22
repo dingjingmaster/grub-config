@@ -7,7 +7,11 @@ declare -r version=1
 # 常用变量
 work_dir=$(dirname $(dirname $(realpath -- $0)))
 
-############################################## 常用函數 ###############################################
+quiet=n
+app_name=$0
+_f_config="$work_dir/config"
+_f_kernel_source="/data/source/kernel"
+
 # 输出信息
 _msg_info() 
 {
@@ -55,6 +59,31 @@ _msg_error()
     if (( _error > 0 )); then
         exit "${_error}"
     fi
+}
+
+# 开始内核编译
+build_kernel()
+{
+    cd "${_f_kernel_source}"
+
+    # 先同步最先代码
+    # 自己仓库主分支默认为 'master'
+    # 上游取名为 'linux' 
+    if [ -d "$_f_kernel_source/.git" ]; then
+        git fetch --all
+        git checkout master
+        git merge linux/master
+        git push
+    fi
+
+    # 开始清除上次编译的结果
+    #make mrproper
+
+    # 添加指定的配置文件
+    cp "$_f_config" "$_f_kernel_source/.config"
+
+    # 开始编译内核
+    make zImage -j32
 }
 
 # 解析参数
@@ -203,6 +232,7 @@ linux-config 当前版本：v$version
    -c, --config <config>        使用指定的内核编译配置 (默认: $work_dir/config)
    -h, --help                   显示此帮助信息并退出
    -v, --version                显示帮助信息并退出
+   -q, --quiet                  显示更少信息（编译过程中的日志打印不输出）
    -k, --kernel <dir>           指定内核源码目录（默认：/data/source/kernel）
 
 EOF
@@ -237,18 +267,22 @@ cleanup()
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
 
-_opt_short='c:k:hv'
-_opt_long=('config:' 'addhooks:' 'kernel:' 'hookdir' : 'hookhelp:' 'help' 'version')
+_opt_short='c:k:hvq'
+_opt_long=('config:' 'addhooks:' 'kernel:' 'hookdir' : 'hookhelp:' 'help' 'version' 'quiet')
 
 parseopts "$_opt_short" "${_opt_long[@]}" -- "$@" || exit 1
 set -- "${OPTRET[@]}"
 unset _opt_short _opt_long OPTRET
+
 
 while :; do
     case $1 in
         -c|--config)
             shift
             _f_config=$1
+            ;;
+        -q|--quiet)
+            quiet=y
             ;;
         -h|--help)
             usage
@@ -260,7 +294,7 @@ while :; do
             ;;
         -k|--kernel)
             shift
-            _kernel_source=$1
+            _f_kernel_source=$1
             ;;
         --)
             shift
@@ -269,6 +303,10 @@ while :; do
     esac
     shift
 done
+
+_msg_info "开始编译内核 ..."
+
+build_kernel
 
 
 
