@@ -1,0 +1,274 @@
+#!/bin/bash
+
+set -e -u
+
+declare -r version=1
+
+# 常用变量
+work_dir=$(dirname $(dirname $(realpath -- $0)))
+
+############################################## 常用函數 ###############################################
+# 输出信息
+_msg_info() 
+{
+    local _msg="${1}"
+    if [[ ${app_name} == '' ]]; then
+        [[ "${quiet}" == "y" ]] || printf '\033[32m信息: %s\033[0m\n' "${_msg}" | sed ':label;N;s/\n/ /g;b label' | sed 's/[ ][ ]*/ /g'
+    else
+        [[ "${quiet}" == "y" ]] || printf '\033[32m[%s] 信息: %s\033[0m\n' "${app_name}" "${_msg}" | sed ':label;N;s/\n/ /g;b label' | sed 's/[ ][ ]*/ /g'
+    fi
+}
+
+# 输出信息
+_msg_info_pure() 
+{
+    local _msg="${1}"
+    if [[ ${app_name} == '' ]]; then
+        [[ "${quiet}" == "y" ]] || printf '\033[32m信息: %s\033[0m\n' "${_msg}" 
+    else
+        [[ "${quiet}" == "y" ]] || printf '\033[32m[%s] 信息: %s\033[0m\n' "${app_name}" "${_msg}" 
+    fi
+}
+
+# 输出警告
+_msg_warning()
+{
+    local _msg="${1}"
+    if [[ ${app_name} == '' ]]; then
+        printf '\033[33m警告: %s\033[0m\n' "${_msg}" >&2
+    else
+        printf '\033[33m[%s] 警告: %s\033[0m\n' "${app_name}" "${_msg}" >&2
+    fi
+}
+
+# 输出错误
+_msg_error()
+{
+    local _msg="${1}"
+    local _error="${2}"
+    if [[ ${app_name} == '' ]]; then
+        printf '\033[31m错误: %s\033[0m\n' "${_msg}" >&2
+    else
+        printf '\033[31m[%s] 错误: %s\033[0m\n' "${app_name}" "${_msg}" >&2
+    fi
+
+    if (( _error > 0 )); then
+        exit "${_error}"
+    fi
+}
+
+# 解析参数
+parseopts() 
+{
+    local opt= optarg= i= shortopts=$1
+    local -a longopts=() unused_argv=()
+
+    shift
+    while [[ $1 && $1 != '--' ]]; do
+        longopts+=("$1")
+        shift
+    done
+    shift
+
+    longoptmatch() {
+        local o longmatch=()
+        for o in "${longopts[@]}"; do
+            if [[ ${o%:} = "$1" ]]; then
+                longmatch=("$o")
+                break
+            fi
+            [[ ${o%:} = "$1"* ]] && longmatch+=("$o")
+        done
+
+        case ${#longmatch[*]} in
+            1)
+                # success, override with opt and return arg req (0 == none, 1 == required)
+                opt=${longmatch%:}
+                if [[ $longmatch = *: ]]; then
+                    return 1
+                else
+                    return 0
+                fi ;;
+            0)
+                # fail, no match found
+                return 255 ;;
+            *)
+                # fail, ambiguous match
+                printf "%s: option '%s' is ambiguous; possibilities:%s\n" "${0##*/}" \
+                    "--$1" "$(printf " '%s'" "${longmatch[@]%:}")"
+                return 254 ;;
+        esac
+    }
+
+    while (( $# )); do
+        case $1 in
+            --) # explicit end of options
+                shift
+                break
+                ;;
+            -[!-]*) # short option
+                for (( i = 1; i < ${#1}; i++ )); do
+                    opt=${1:i:1}
+
+                    # option doesn't exist
+                    if [[ $shortopts != *$opt* ]]; then
+                        printf "%s: 参数不合法 -- '%s'\n" "${0##*/}" "$opt"
+                        OPTRET=(--)
+                        return 1
+                    fi
+
+                    OPTRET+=("-$opt")
+                    # option requires optarg
+                    if [[ $shortopts = *$opt:* ]]; then
+                        # if we're not at the end of the option chunk, the rest is the optarg
+                        if (( i < ${#1} - 1 )); then
+                            OPTRET+=("${1:i+1}")
+                            break
+                        # if we're at the end, grab the the next positional, if it exists
+                        elif (( i == ${#1} - 1 )) && [[ "$2" ]]; then
+                            OPTRET+=("$2")
+                            shift
+                            break
+                        # parse failure
+                        else
+                            printf "%s: 配置选项 '%s' 需要一个参数\n" "${0##*/}" "-$opt"
+                            OPTRET=(--)
+                            return 1
+                        fi
+                    fi
+                done
+                ;;
+            --?*=*|--?*) # long option
+                IFS='=' read -r opt optarg <<< "${1#--}"
+                longoptmatch "$opt"
+                case $? in
+                    0)
+                        if [[ $optarg ]]; then
+                            printf "%s: 配置选项 '--%s' 无需任何参数\n" "${0##*/}" "$opt"
+                            OPTRET=(--)
+                            return 1
+                        else
+                            OPTRET+=("--$opt")
+                        fi
+                        ;;
+                    1)
+                        # --longopt=optarg
+                        if [[ $optarg ]]; then
+                            OPTRET+=("--$opt" "$optarg")
+                        # --longopt optarg
+                        elif [[ "$2" ]]; then
+                            OPTRET+=("--$opt" "$2" )
+                            shift
+                        else
+                            printf "%s: 配置选项 '--%s' 需要参数!\n" "${0##*/}" "$opt"
+                            OPTRET=(--)
+                            return 1
+                        fi
+                        ;;
+                    254)
+                        # ambiguous option -- error was reported for us by longoptmatch()
+                        OPTRET=(--)
+                        return 1
+                        ;;
+                    255)
+                        # parse failure
+                        printf "%s: 未定义的配置选项 '%s'\n" "${0##*/}" "--$opt"
+                        OPTRET=(--)
+                        return 1
+                        ;;
+                esac
+                ;;
+            *) # non-option arg encountered, add it as a parameter
+                unused_argv+=("$1")
+                ;;
+        esac
+        shift
+    done
+
+    # add end-of-opt terminator and any leftover positional parameters
+    OPTRET+=('--' "${unused_argv[@]}" "$@")
+    unset longoptmatch
+
+    return 0
+}
+
+# 使用说明
+usage() 
+{
+    cat <<EOF
+linux-config 当前版本：v$version
+使用: ${0##*/} [配置选项]
+
+  配置选项:
+   -c, --config <config>        使用指定的内核编译配置 (默认: $work_dir/config)
+   -h, --help                   显示此帮助信息并退出
+   -v, --version                显示帮助信息并退出
+   -k, --kernel <dir>           指定内核源码目录（默认：/data/source/kernel）
+
+EOF
+}
+
+# 输出版本信息
+version() 
+{
+    cat <<EOF
+linux-config 当前版本: v$version
+EOF
+}
+
+cleanup()
+{
+    local err=${1:-$?}
+
+    #if [[ $_d_workdir ]]; then
+    #    # when _optpreset is set, we're in the main loop, not a worker process
+    #    if (( _optsavetree )) && [[ -z ${_optpreset[*]} ]]; then
+    #        printf '%s\n' "${!_autodetect_cache[@]}" > "$_d_workdir/autodetect_modules"
+    #        msg "build directory saved in %s" "$_d_workdir"
+    #    else
+    #        rm -rf "$_d_workdir"
+    #    fi
+    #fi
+
+    exit "$err"
+}
+
+
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+
+_opt_short='c:k:hv'
+_opt_long=('config:' 'addhooks:' 'kernel:' 'hookdir' : 'hookhelp:' 'help' 'version')
+
+parseopts "$_opt_short" "${_opt_long[@]}" -- "$@" || exit 1
+set -- "${OPTRET[@]}"
+unset _opt_short _opt_long OPTRET
+
+while :; do
+    case $1 in
+        -c|--config)
+            shift
+            _f_config=$1
+            ;;
+        -h|--help)
+            usage
+            cleanup 0
+            ;;
+        -v|--version)
+            version
+            cleanup 0
+            ;;
+        -k|--kernel)
+            shift
+            _kernel_source=$1
+            ;;
+        --)
+            shift
+            break 2
+            ;;
+    esac
+    shift
+done
+
+
+
