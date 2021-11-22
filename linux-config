@@ -5,10 +5,11 @@ set -e -u
 declare -r version=1
 
 # 常用变量
-work_dir=$(dirname $(dirname $(realpath -- $0)))
+work_dir=$(dirname $(realpath -- $0))
 
 quiet=n
-app_name=$0
+append_date=$(date "+%F")
+app_name="linux-config"
 _f_config="$work_dir/config"
 _f_kernel_source="/data/source/kernel"
 
@@ -27,11 +28,7 @@ _msg_info()
 _msg_info_pure() 
 {
     local _msg="${1}"
-    if [[ ${app_name} == '' ]]; then
-        [[ "${quiet}" == "y" ]] || printf '\033[32m信息: %s\033[0m\n' "${_msg}" 
-    else
-        [[ "${quiet}" == "y" ]] || printf '\033[32m[%s] 信息: %s\033[0m\n' "${app_name}" "${_msg}" 
-    fi
+    printf '\033[32m%s\033[0m\n' "${_msg}" 
 }
 
 # 输出警告
@@ -64,16 +61,24 @@ _msg_error()
 # 开始内核编译
 build_kernel()
 {
+    if [ ! -d "$work_dir/out" ]; then
+        _msg_info "创建工作目录:${work_dir}/out"
+        mkdir -p "$work_dir/out"
+    fi
+
     cd "${_f_kernel_source}"
 
     # 先同步最先代码
     # 自己仓库主分支默认为 'master'
     # 上游取名为 'linux' 
-    if [ -d "$_f_kernel_source/.git" ]; then
-        git fetch --all
-        git checkout master
-        git merge linux/master
-        git push
+    if [ ! -f "$work_dir/out/${append_date}" ]; then
+        if [ -d "$_f_kernel_source/.git" ]; then
+            git fetch --all
+            git checkout master
+            git merge linux/master
+            git push
+            touch "$work_dir/out/${append_date}"
+        fi
     fi
 
     # 开始清除上次编译的结果
@@ -83,7 +88,7 @@ build_kernel()
     cp "$_f_config" "$_f_kernel_source/.config"
 
     # 开始编译内核
-    make zImage -j32
+    make bzImage -j32
 }
 
 # 解析参数
@@ -303,6 +308,12 @@ while :; do
     esac
     shift
 done
+
+clear;
+_msg_info_pure "当前信息如下:"
+_msg_info_pure "             当前工作目录: ${work_dir}"
+
+echo -e "\n\n"
 
 _msg_info "开始编译内核 ..."
 
