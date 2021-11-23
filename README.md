@@ -19,6 +19,6 @@ linux 内核相关配置与生成
 
   - [ ] 更新 `grub` 启动菜单
   - [ ] 安装 `内核文件` 和 `initramfs`
-  - [ ] 根据内核文件生成 `initramfs`
-  - [ ] 编译生成内核文件和模块文件
+  - [x] 根据内核文件生成 `initramfs`
+  - [x] 编译生成内核文件和模块文件
   - [x] 同步上游 kernel 代码 <需要按[<sup>1</sup>](#usage-config)完成配置>
