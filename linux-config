@@ -4,14 +4,24 @@ set -e -u
 
 declare -r version=1
 
+export LOCALVERSION="-GracefulLinux"
+
 # 常用变量
 work_dir=$(dirname $(realpath -- $0))
 
 quiet=n
-append_date=$(date "+%F")
+append_date=$(date "+%Y%m%d")
 app_name="linux-config"
 _f_config="$work_dir/config"
 _f_kernel_source="/data/source/kernel"
+out_dir="${work_dir}/out/${append_date}"
+
+# 会改变的值
+kernel_version=""
+systemmap="$out_dir/System.map"
+kernel="$out_dir/vmlinux-${kernel_version}-$(uname -m)-${append_date}"
+initramfs="$out_dir/initramfs-${kernel_version}-$(uname -m)-${append_date}.img"
+
 
 # 输出信息
 _msg_info() 
@@ -61,34 +71,56 @@ _msg_error()
 # 开始内核编译
 build_kernel()
 {
-    if [ ! -d "$work_dir/out" ]; then
-        _msg_info "创建工作目录:${work_dir}/out"
-        mkdir -p "$work_dir/out"
-    fi
-
     cd "${_f_kernel_source}"
 
     # 先同步最先代码
     # 自己仓库主分支默认为 'master'
     # 上游取名为 'linux' 
-    if [ ! -f "$work_dir/out/${append_date}" ]; then
+    if [ ! -d "$out_dir" ]; then
+        mkdir -p "$out_dir"
         if [ -d "$_f_kernel_source/.git" ]; then
             git fetch --all
             git checkout master
             git merge linux/master
             git push
-            touch "$work_dir/out/${append_date}"
         fi
     fi
 
     # 开始清除上次编译的结果
     #make mrproper
 
-    # 添加指定的配置文件
-    cp "$_f_config" "$_f_kernel_source/.config"
-
     # 开始编译内核
     make bzImage -j32
+
+    # 复制编译成功的文件
+    if [ -f "$PWD/vmlinux" ]; then
+        _msg_info "内核编译成功!"
+        cp System.map   "$systemmap"
+        cp vmlinux      "$kernel"
+    else
+        _msg_error "内核编译失败!" -1
+    fi
+
+    # 开始编译内核模块
+    export INSTALL_MOD_STRIP=1
+    export INSTALL_MOD_PATH="$out_dir"
+    _msg_info "make -j32 modules"
+    make -j32 modules
+
+    _msg_info "make -j32 modules_install"
+    make -j32 modules_install
+
+    cd "$OLDPWD"
+}
+
+gen_initramfs()
+{
+    if [ ! -f "$kernel" ]; then
+        _msg_error "内核文件 '$kernel' 没有正确生成" -1
+    fi
+
+    _msg_info "mkinitcpio -r ${out_dir} -k ${kernel_version} -g ${initramfs}"
+    mkinitcpio -r "${out_dir}" -k "${kernel_version}" -g "${initramfs}"
 }
 
 # 解析参数
@@ -309,15 +341,51 @@ while :; do
     shift
 done
 
-clear;
-_msg_info_pure "当前信息如下:"
-_msg_info_pure "             当前工作目录: ${work_dir}"
+# 检查环境
+check_env()
+{
+    cd "${_f_kernel_source}"
 
-echo -e "\n\n"
+    # 添加指定的配置文件
+    cp "$_f_config" "$_f_kernel_source/.config"
+
+    make prepare
+
+    kernel_version=$(make -s 'kernelrelease')
+    kernel="$out_dir/vmlinux-${kernel_version}-$(uname -m)-${append_date}"
+    initramfs="$out_dir/initramfs-${kernel_version}-$(uname -m)-${append_date}"
+
+    _msg_info_pure "当前信息如下:"
+    _msg_info_pure "                   时间戳: ${append_date}"
+    _msg_info_pure "                 系统架构: $(uname -m)"
+    _msg_info_pure "                 内核版本: ${kernel_version}"
+    _msg_info_pure "             当前工作目录: ${work_dir}"
+    _msg_info_pure "             内核配置文件: ${_f_config}"
+    _msg_info_pure "             内核源码目录: ${_f_kernel_source}"
+    _msg_info_pure "             输出结果目录: ${out_dir}"
+    _msg_info_pure "             输出内核路径: ${kernel}"
+    _msg_info_pure "        输出initramfs路径: ${initramfs}"
+    _msg_info_pure "       输出System.map路径: ${systemmap}"
+    _msg_info_pure "               mkinitcpio: $(type -p 'mkinitcpio')"
+
+    echo -e "\n\n"
+
+    cd $OLDPWD
+}
+
+
+
+
+##### main 开始
+_msg_info "开始检查脚本运行环境 ..."
+check_env
 
 _msg_info "开始编译内核 ..."
-
 build_kernel
 
+_msg_info "开始生成initramfs ..."
+gen_initramfs
+
+##### main 结束
 
 
