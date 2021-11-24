@@ -16,11 +16,16 @@ _f_config="$work_dir/config"
 _f_kernel_source="/data/source/kernel"
 out_dir="${work_dir}/out/${append_date}"
 
+systemmap="$out_dir/System.map"
+grub_config="/boot/grub/grub.cfg"
+
 # 会改变的值
 kernel_version=""
-systemmap="$out_dir/System.map"
-kernel="$out_dir/vmlinux-${kernel_version}-$(uname -m)-${append_date}"
-initramfs="$out_dir/initramfs-${kernel_version}-$(uname -m)-${append_date}.img"
+kernel_name="vmlinux-${kernel_version}-$(uname -m)-${append_date}"
+initramfs_name="initramfs-${kernel_version}-$(uname -m)-${append_date}.img"
+module="$out_dir/lib/modules/${kernel_version}"
+kernel="$out_dir/${kernel_name}"
+initramfs="$out_dir/${initramfs_name}"
 
 
 # 输出信息
@@ -63,7 +68,7 @@ _msg_error()
         printf '\033[31m[%s] 错误: %s\033[0m\n' "${app_name}" "${_msg}" >&2
     fi
 
-    if (( _error > 0 )); then
+    if (( _error != 0 )); then
         exit "${_error}"
     fi
 }
@@ -284,16 +289,63 @@ update_grub()
 
     # 添加自定义配置，开机显示 grub 菜单
     sudo cp "${work_dir}/00_header" "/etc/grub.d"
+    sudo cp "${work_dir}/11_graceful" "/etc/grub.d"
 
     # 执行
     if [ -f "/usr/bin/update-grub" ]; then
-        sudo update-grub
+        sudo update-grub -o "${grub_config}"
     elif [ -f "/usr/bin/grub-mkconfig" ]; then
-        sudo grub-mkconfig -o /boot/grub/grub.cfg 
+        sudo grub-mkconfig -o "${grub_config}"
     else
         _msg_error "检测到 grub-mkconfig 或 update-grub 不存在!" -1
     fi
     
+}
+
+# 安装内核文件
+kernel_install()
+{
+    # 检查内核文件是否生成
+    if [ ! -f "${systemmap}" ]; then 
+        _msg_error "没有生成 '${systemmap}'" -1
+    fi
+
+    if [ ! -f "${kernel}" ]; then 
+        _msg_error "没有生成 '${kernel}'" -1
+    fi
+
+    if [ ! -f "${initramfs}" ]; then 
+        _msg_error "没有生成 '${initramfs}'" -1
+    fi
+
+    if [ ! -f "${grub_config}" ]; then 
+        _msg_error "没有生成 '${grub_config}'" -1
+    fi
+
+    if [ ! -d "${module}" ]; then
+        _msg_error "没有生成 '${module}'" -1
+    fi
+
+    # 开始安装
+    if [ -f '/boot/System.map' ]; then
+        sudo mv '/boot/System.map' '/boot/System.map.old'
+    fi
+    sudo cp "${systemmap}" '/boot/' 
+
+    if [ -f "/boot/${kernel_name}" ]; then
+        sudo rm -f "/boot/${kernel_name}"
+    fi
+    sudo cp "${kernel}" "/boot/${kernel_name}"
+
+    if [ -f "/boot/${initramfs_name}" ]; then
+        sudo rm -f "/boot/${initramfs_name}"
+    fi
+    sudo cp "${initramfs}" "/boot/${initramfs_name}"
+
+    if [ -f "/usr/lib/modules/${kernel_name}" ]; then
+        sudo rm -rf "/usr/lib/modules/${kernel_name}"
+    fi
+    sudo cp -r "${module}" '/usr/lib/modules/'
 }
 
 # 输出版本信息
@@ -325,8 +377,8 @@ cleanup()
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
 
-_opt_short='c:k:hvq'
-_opt_long=('config:' 'addhooks:' 'kernel:' 'hookdir' : 'hookhelp:' 'help' 'version' 'quiet')
+_opt_short='c:k:o:hvq'
+_opt_long=('config:' 'addhooks:' 'kernel:' 'hookdir' : 'hookhelp:' 'grubOutput:' 'help' 'version' 'quiet')
 
 parseopts "$_opt_short" "${_opt_long[@]}" -- "$@" || exit 1
 set -- "${OPTRET[@]}"
@@ -341,6 +393,14 @@ while :; do
             ;;
         -q|--quiet)
             quiet=y
+            ;;
+        -o|--grubOutput)
+            grubp="$1"
+            if [[ x"$grubp" =~ ^x"/*" ]]; then
+                grub_config="$1"
+            else
+                grub_config="${work_dir}/out/${append_date}/grub.cfg"
+            fi
             ;;
         -h|--help)
             usage
@@ -373,8 +433,12 @@ check_env()
     make prepare
 
     kernel_version=$(make -s 'kernelrelease')
-    kernel="$out_dir/vmlinux-${kernel_version}-$(uname -m)-${append_date}"
-    initramfs="$out_dir/initramfs-${kernel_version}-$(uname -m)-${append_date}"
+    kernel_name="vmlinux-${kernel_version}-$(uname -m)-${append_date}"
+    initramfs_name="initramfs-${kernel_version}-$(uname -m)-${append_date}.img"
+
+    module="$out_dir/lib/modules/${kernel_version}"
+    kernel="$out_dir/${kernel_name}"
+    initramfs="$out_dir/${initramfs_name}"
 
     _msg_info_pure "当前信息如下:"
     _msg_info_pure "                   时间戳: ${append_date}"
@@ -388,6 +452,7 @@ check_env()
     _msg_info_pure "        输出initramfs路径: ${initramfs}"
     _msg_info_pure "       输出System.map路径: ${systemmap}"
     _msg_info_pure "               mkinitcpio: $(type -p 'mkinitcpio')"
+    _msg_info_pure "         输出grub配置路径: ${grub_config}"
 
     echo -e "\n\n"
 
@@ -408,6 +473,10 @@ _msg_info "开始生成 initramfs ..."
 gen_initramfs
 
 _msg_info "接下来的操作需要提权 ..."
+
+_msg_info "将内核文件安装到指定位置 ..."
+kernel_install
+
 _msg_info "开始更新 grub 配置文件 ..."
 update_grub
 
