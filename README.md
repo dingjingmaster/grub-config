@@ -2,6 +2,7 @@
 linux 内核相关配置与生成
 
 ### 使用方法 <div id="usage-config"></div>
+  - 需要配置 `/boot/grub/grubenv` 添加 `feature_timeout_style=y` 启动时候打开 grub 菜单
   - 打开 `linux` 内核项目并 `fork` 到自己仓库
   - 克隆已经 `fork` 的内核仓库  `git clone git@github:<用户名>/<内核仓库名>`
   - 进入已 `clone` 的内核仓库根目录，执行 `git remote add linux https://github.com/torvalds/linux.git` 添加上游代码仓库

@@ -275,6 +275,27 @@ linux-config 当前版本：v$version
 EOF
 }
 
+# 更新 grub 配置
+update_grub()
+{
+    if [ ! -d "/etc/grub.d" ]; then
+        _msg_error "检测到文件夹 /etc/grub.d 不存在!" -1
+    fi
+
+    # 添加自定义配置，开机显示 grub 菜单
+    sudo cp "${work_dir}/00_header" "/etc/grub.d"
+
+    # 执行
+    if [ -f "/usr/bin/update-grub" ]; then
+        sudo update-grub
+    elif [ -f "/usr/bin/grub-mkconfig" ]; then
+        sudo grub-mkconfig -o /boot/grub/grub.cfg 
+    else
+        _msg_error "检测到 grub-mkconfig 或 update-grub 不存在!" -1
+    fi
+    
+}
+
 # 输出版本信息
 version() 
 {
@@ -383,8 +404,12 @@ check_env
 _msg_info "开始编译内核 ..."
 build_kernel
 
-_msg_info "开始生成initramfs ..."
+_msg_info "开始生成 initramfs ..."
 gen_initramfs
+
+_msg_info "接下来的操作需要提权 ..."
+_msg_info "开始更新 grub 配置文件 ..."
+update_grub
 
 ##### main 结束
 
