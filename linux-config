@@ -21,8 +21,8 @@ grub_config="/boot/grub/grub.cfg"
 
 # 会改变的值
 kernel_version=""
-kernel_name="vmlinux-${kernel_version}-$(uname -m)-${append_date}"
-initramfs_name="initramfs-${kernel_version}-$(uname -m)-${append_date}.img"
+kernel_name="vmlinux-${kernel_version}-$(uname -m)"
+initramfs_name="initramfs-${kernel_version}-$(uname -m).img"
 module="$out_dir/lib/modules/${kernel_version}"
 kernel="$out_dir/${kernel_name}"
 initramfs="$out_dir/${initramfs_name}"
@@ -91,9 +91,6 @@ build_kernel()
         fi
     fi
 
-    # 开始清除上次编译的结果
-    #make mrproper
-
     # 开始编译内核
     make bzImage -j32
 
@@ -101,19 +98,19 @@ build_kernel()
     if [ -f "$PWD/vmlinux" ]; then
         _msg_info "内核编译成功!"
         cp System.map   "$systemmap"
-        cp vmlinux      "$kernel"
+        cp "arch/x86/boot/bzImage" "$kernel"
     else
         _msg_error "内核编译失败!" -1
     fi
 
     # 开始编译内核模块
-    export INSTALL_MOD_STRIP=1
-    export INSTALL_MOD_PATH="$out_dir"
+    #export INSTALL_MOD_STRIP=1
+    #export INSTALL_MOD_PATH="$out_dir"
     _msg_info "make -j32 modules"
     make -j32 modules
 
     _msg_info "make -j32 modules_install"
-    make -j32 modules_install
+    sudo make -j32 modules_install
 
     cd "$OLDPWD"
 }
@@ -125,7 +122,8 @@ gen_initramfs()
     fi
 
     _msg_info "mkinitcpio -r ${out_dir} -k ${kernel_version} -g ${initramfs}"
-    mkinitcpio -r "${out_dir}" -k "${kernel_version}" -g "${initramfs}"
+    mkinitcpio -k "${kernel_version}" -g "${initramfs}"
+    sudo cp "${initramfs}" "/boot/"
 }
 
 # 解析参数
@@ -314,21 +312,13 @@ kernel_install()
         _msg_error "没有生成 '${kernel}'" -1
     fi
 
-    if [ ! -f "${initramfs}" ]; then 
-        _msg_error "没有生成 '${initramfs}'" -1
-    fi
-
     if [ ! -f "${grub_config}" ]; then 
         _msg_error "没有生成 '${grub_config}'" -1
     fi
 
-    if [ ! -d "${module}" ]; then
-        _msg_error "没有生成 '${module}'" -1
-    fi
-
     # 开始安装
     if [ -f '/boot/System.map' ]; then
-        sudo mv '/boot/System.map' '/boot/System.map.old'
+        sudo mv '/boot/System.map' '/boot/System.old'
     fi
     sudo cp "${systemmap}" '/boot/' 
 
@@ -336,16 +326,6 @@ kernel_install()
         sudo rm -f "/boot/${kernel_name}"
     fi
     sudo cp "${kernel}" "/boot/${kernel_name}"
-
-    if [ -f "/boot/${initramfs_name}" ]; then
-        sudo rm -f "/boot/${initramfs_name}"
-    fi
-    sudo cp "${initramfs}" "/boot/${initramfs_name}"
-
-    if [ -f "/usr/lib/modules/${kernel_name}" ]; then
-        sudo rm -rf "/usr/lib/modules/${kernel_name}"
-    fi
-    sudo cp -r "${module}" '/usr/lib/modules/'
 }
 
 # 输出版本信息
@@ -427,14 +407,17 @@ check_env()
 {
     cd "${_f_kernel_source}"
 
+    # 开始清除上次编译的结果
+    #make mrproper
+
     # 添加指定的配置文件
     cp "$_f_config" "$_f_kernel_source/.config"
 
     make prepare
 
     kernel_version=$(make -s 'kernelrelease')
-    kernel_name="vmlinux-${kernel_version}-$(uname -m)-${append_date}"
-    initramfs_name="initramfs-${kernel_version}-$(uname -m)-${append_date}.img"
+    kernel_name="vmlinux-${kernel_version}-$(uname -m)"
+    initramfs_name="initramfs-${kernel_version}-$(uname -m).img"
 
     module="$out_dir/lib/modules/${kernel_version}"
     kernel="$out_dir/${kernel_name}"
@@ -466,16 +449,16 @@ check_env()
 _msg_info "开始检查脚本运行环境 ..."
 check_env
 
+_msg_info "接下来的操作需要提权 ..."
+
 _msg_info "开始编译内核 ..."
 build_kernel
 
-_msg_info "开始生成 initramfs ..."
-gen_initramfs
-
-_msg_info "接下来的操作需要提权 ..."
-
 _msg_info "将内核文件安装到指定位置 ..."
 kernel_install
+
+_msg_info "开始生成 initramfs ..."
+gen_initramfs
 
 _msg_info "开始更新 grub 配置文件 ..."
 update_grub

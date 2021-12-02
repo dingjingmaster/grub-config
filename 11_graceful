@@ -41,6 +41,8 @@ fi
 
 echo "grub_distributor is '${GRUB_DISTRIBUTOR_OLD}' to '${GRUB_DISTRIBUTOR}'" >&2
 
+GRUB_DISTRIBUTOR="${GRUB_DISTRIBUTOR_OLD}"
+
 # loop-AES arranges things so that /dev/loop/X can be our root device, but
 # the initrds that Linux uses don't like that.
 case ${GRUB_DEVICE} in
@@ -353,4 +355,3 @@ fi
 echo "$title_correction_code"
 
 
-GRUB_DISTRIBUTOR="${GRUB_DISTRIBUTOR_OLD}"
