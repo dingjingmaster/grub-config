@@ -480,7 +480,7 @@ list_initramfs() {
 
     compress=$(detect_file_type "${img}")
 
-    ${compress:-cat} ${compress:+-cd} "$img" | bsdcpio -i
+    ${compress:-cat} ${compress:+-cd} "$img" | bsdcpio --list
 }
 
 main() {
@@ -523,6 +523,7 @@ while :; do
         -l|--list)
             shift
             list_initramfs "$1"
+            exit 0
             ;;
         -q|--quiet)
             quiet=y
@@ -537,7 +538,7 @@ while :; do
             ;;
         -h|--help)
             usage
-            cleanup 0
+            exit 0
             ;;
         -r|--run)
             main
@@ -545,7 +546,7 @@ while :; do
             ;;
         -v|--version)
             version
-            cleanup 0
+            exit 0
             ;;
         -k|--kernel)
             shift
