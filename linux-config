@@ -26,6 +26,7 @@ initramfs_name="initramfs-${kernel_version}-$(uname -m).img"
 module="$out_dir/lib/modules/${kernel_version}"
 kernel="$out_dir/${kernel_name}"
 initramfs="$out_dir/${initramfs_name}"
+canrun=
 
 # 输出信息
 _msg_info() 
@@ -76,6 +77,558 @@ _msg_error()
         exit "${_error}"
     fi
 }
+
+in_array() {
+    # Search for an element in an array.
+    #   $1: needle
+    #   ${@:2}: haystack
+
+    local item= needle=$1; shift
+
+    for item in "$@"; do
+        [[ $item = $needle ]] && return 0 # Found
+    done
+    return 1 # Not Found
+}
+
+index_of() {
+    # get the array index of an item. sets the global var _idx with
+    # index and returns 0 if found, otherwise returns 1.
+    local item=$1; shift
+
+    for (( _idx=1; _idx <= $#; _idx++ )); do
+        if [[ $item = ${!_idx} ]]; then
+            (( --_idx ))
+            return 0
+        fi
+    done
+
+    # not found
+    unset _idx
+    return 1
+}
+
+funcgrep() {
+    awk -v funcmatch="$1" '
+        /^[[:space:]]*[[:alnum:]_]+[[:space:]]*\([[:space:]]*\)/ {
+            match($1, funcmatch)
+            print substr($1, RSTART, RLENGTH)
+        }' "$2"
+}
+
+list_hookpoints() {
+    local funcs script
+
+    script=$(PATH=$_d_hooks type -P "$1") || return 0
+
+    mapfile -t funcs < <(funcgrep '^run_[[:alnum:]_]+' "$script")
+
+    echo
+    msg "This hook has runtime scripts:"
+    in_array run_earlyhook "${funcs[@]}" && msg2 "early hook"
+    in_array run_hook "${funcs[@]}" && msg2 "pre-mount hook"
+    in_array run_latehook "${funcs[@]}" && msg2 "post-mount hook"
+    in_array run_cleanuphook "${funcs[@]}" && msg2 "cleanup hook"
+}
+
+modprobe() {
+    command modprobe -d "$_optmoduleroot" -S "$KERNELVERSION" "$@"
+}
+
+auto_modules() {
+    # Perform auto detection of modules via sysfs.
+
+    local mods=
+
+    mapfile -t mods < <(find /sys/devices -name uevent \
+        -exec sort -u {} + | awk -F= '$1 == "MODALIAS" && !_[$0]++')
+    mapfile -t mods < <(modprobe -qaR "${mods[@]#MODALIAS=}")
+
+    (( ${#mods[*]} )) && printf "%s\n" "${mods[@]//-/_}"
+}
+
+all_modules() {
+    # Add modules to the initcpio, filtered by grep.
+    #   $@: filter arguments to grep
+    #   -f FILTER: ERE to filter found modules
+
+    local -i count=0
+    local mod= OPTIND= OPTARG= filter=()
+
+    while getopts ':f:' flag; do
+        case $flag in f) filter+=("$OPTARG") ;; esac
+    done
+    shift $(( OPTIND - 1 ))
+
+    while read -r -d '' mod; do
+        (( ++count ))
+
+        for f in "${filter[@]}"; do
+            [[ $mod =~ $f ]] && continue 2
+        done
+
+        mod=${mod##*/}
+        mod="${mod%.ko*}"
+        printf '%s\n' "${mod//-/_}"
+    done < <(find "$_d_kmoduledir" -name '*.ko*' -print0 2>/dev/null | grep -EZz "$@")
+
+    (( count ))
+}
+
+add_all_modules() {
+    # Add modules to the initcpio.
+    #   $@: arguments to all_modules
+
+    local mod mods
+
+    mapfile -t mods < <(all_modules "$@")
+    map add_module "${mods[@]}"
+
+    return $(( !${#mods[*]} ))
+}
+
+add_checked_modules() {
+    # Add modules to the initcpio, filtered by the list of autodetected
+    # modules.
+    #   $@: arguments to all_modules
+
+    local mod mods
+
+    if (( ${#_autodetect_cache[*]} )); then
+        mapfile -t mods < <(all_modules "$@" | grep -xFf <(printf '%s\n' "${!_autodetect_cache[@]}"))
+    else
+        mapfile -t mods < <(all_modules "$@")
+    fi
+
+    map add_module "${mods[@]}"
+
+    return $(( !${#mods[*]} ))
+}
+
+add_firmware() {
+    # add a firmware file to the image.
+    #   $1: firmware path fragment
+
+    local fw fwpath r=1
+
+    for fw; do
+        for fwpath in "${_d_firmware[@]}"; do
+            if [[ -f $fwpath/$fw.xz ]]; then
+                add_file "$fwpath/$fw.xz" "$fwpath/$fw.xz" 644 && r=0
+                break
+            elif [[ -f $fwpath/$fw ]]; then
+                add_file "$fwpath/$fw" "$fwpath/$fw" 644 && r=0
+                break
+            fi
+        done
+    done
+
+    return $r
+}
+
+add_module() {
+    # Add a kernel module to the initcpio image. Dependencies will be
+    # discovered and added.
+    #   $1: module name
+
+    local target= module= softdeps= deps= field= value= firmware=()
+    local ign_errors=0 found=0
+
+    [[ $KERNELVERSION == none ]] && return 0
+
+    if [[ $1 = *\? ]]; then
+        ign_errors=1
+        set -- "${1%?}"
+    fi
+
+    target=${1%.ko*} target=${target//-/_}
+
+    # skip expensive stuff if this module has already been added
+    (( _addedmodules["$target"] == 1 )) && return
+
+    while IFS=':= ' read -r -d '' field value; do
+        case "$field" in
+            filename)
+                # Only add modules with filenames that look like paths (e.g.
+                # it might be reported as "(builtin)"). We'll defer actually
+                # checking whether or not the file exists -- any errors can be
+                # handled during module install time.
+                if [[ $value = /* ]]; then
+                    found=1
+                    module=${value##*/} module=${module%.ko*}
+                    quiet "adding module: %s (%s)" "$module" "$value"
+                    _modpaths["$value"]=1
+                    _addedmodules["${module//-/_}"]=1
+                fi
+                ;;
+            depends)
+                IFS=',' read -r -a deps <<< "$value"
+                map add_module "${deps[@]}"
+                ;;
+            firmware)
+                firmware+=("$value")
+                ;;
+            softdep)
+                read -ra softdeps <<<"$value"
+                for module in "${softdeps[@]}"; do
+                    [[ $module == *: ]] && continue
+                    add_module "$module?"
+                done
+                ;;
+        esac
+    done < <(modinfo -b "$_optmoduleroot" -k "$KERNELVERSION" -0 "$target" 2>/dev/null)
+
+    if (( !found )); then
+        (( ign_errors || _addedmodules["$target"] )) && return 0
+        error "module not found: \`%s'" "$target"
+        return 1
+    fi
+
+    if (( ${#firmware[*]} )); then
+        add_firmware "${firmware[@]}" ||
+            warning 'Possibly missing firmware for module: %s' "$target"
+    fi
+
+    # handle module quirks
+    case $target in
+        fat)
+            add_module "nls_ascii?" # from CONFIG_FAT_DEFAULT_IOCHARSET
+            add_module "nls_cp437?" # from CONFIG_FAT_DEFAULT_CODEPAGE
+            ;;
+        ocfs2)
+            add_module "configfs?"
+            ;;
+        btrfs)
+            add_module "libcrc32c?"
+            ;;
+        f2fs)
+            add_module "crypto-crc32?"
+            ;;
+        ext4)
+            add_module "crypto-crc32c?"
+            ;;
+    esac
+}
+
+add_full_dir() {
+    # Add a directory and all its contents, recursively, to the initcpio image.
+    # No parsing is performed and the contents of the directory is added as is.
+    #   $1: path to directory
+    #   $2: glob pattern to filter file additions (optional)
+    #   $3: path prefix that will be stripped off from the image path (optional)
+
+    local f= filter=${2:-*} strip_prefix=$3
+
+    if [[ -n $1 && -d $1 ]]; then
+        add_dir "$1"
+
+        for f in "$1"/*; do
+            if [[ -L $f ]]; then
+                if [[ $f = $filter ]]; then
+                    add_symlink "${f#$strip_prefix}" "$(readlink "$f")"
+                fi
+            elif [[ -d $f ]]; then
+                add_full_dir "$f" "$filter" "$strip_prefix"
+            elif [[ -f $f ]]; then
+                if [[ $f = $filter ]]; then
+                    add_file "$f" "${f#$strip_prefix}"
+                fi
+            fi
+        done
+    fi
+}
+
+add_dir() {
+    # add a directory (with parents) to $BUILDROOT
+    #   $1: pathname on initcpio
+    #   $2: mode (optional)
+
+    if [[ -z $1 || $1 != /?* ]]; then
+        return 1
+    fi
+
+    local path=$1 mode=${2:-755}
+
+    if [[ -d $BUILDROOT$1 ]]; then
+        # ignore dir already exists
+        return 0
+    fi
+
+    quiet "adding dir: %s" "$path"
+    command install -dm$mode "$BUILDROOT$path"
+}
+
+add_symlink() {
+    # Add a symlink to the initcpio image. There is no checking done
+    # to ensure that the target of the symlink exists.
+    #   $1: pathname of symlink on image
+    #   $2: absolute path to target of symlink (optional, can be read from $1)
+
+    local name=$1 target=$2
+
+    (( $# == 1 || $# == 2 )) || return 1
+
+    if [[ -z $target ]]; then
+        target=$(readlink -f "$name")
+        if [[ -z $target ]]; then
+            error 'invalid symlink: %s' "$name"
+            return 1
+        fi
+    fi
+
+    add_dir "${name%/*}"
+
+    if [[ -L $BUILDROOT$1 ]]; then
+        quiet "overwriting symlink %s -> %s" "$name" "$target"
+    else
+        quiet "adding symlink: %s -> %s" "$name" "$target"
+    fi
+    ln -sfn "$target" "$BUILDROOT$name"
+}
+
+add_file() {
+    # Add a plain file to the initcpio image. No parsing is performed and only
+    # the singular file is added.
+    #   $1: path to file
+    #   $2: destination on initcpio (optional, defaults to same as source)
+    #   $3: mode
+
+    (( $# )) || return 1
+
+    # determine source and destination
+    local src=$1 dest=${2:-$1} mode=
+
+    if [[ ! -f $src ]]; then
+        error "file not found: \`%s'" "$src"
+        return 1
+    fi
+
+    mode=${3:-$(stat -c %a "$src")}
+    if [[ -z $mode ]]; then
+        error "failed to stat file: \`%s'." "$src"
+        return 1
+    fi
+
+    if [[ -e $BUILDROOT$dest ]]; then
+        quiet "overwriting file: %s" "$dest"
+    else
+        quiet "adding file: %s" "$dest"
+    fi
+    command install -Dm$mode "$src" "$BUILDROOT$dest"
+}
+
+add_runscript() {
+    # Adds a runtime script to the initcpio image. The name is derived from the
+    # script which calls it as the basename of the caller.
+
+    local funcs fn script hookname=${BASH_SOURCE[1]##*/}
+
+    if ! script=$(PATH=$_d_hooks type -P "$hookname"); then
+        error "runtime script for \`%s' not found" "$hookname"
+        return
+    fi
+
+    add_file "$script" "/hooks/$hookname" 755
+
+    mapfile -t funcs < <(funcgrep '^run_[[:alnum:]_]+' "$script")
+
+    for fn in "${funcs[@]}"; do
+        case $fn in
+            run_earlyhook)
+                _runhooks['early']+=" $hookname"
+                ;;
+            run_hook)
+                _runhooks['hooks']+=" $hookname"
+                ;;
+            run_latehook)
+                _runhooks['late']+=" $hookname"
+                ;;
+            run_cleanuphook)
+                _runhooks['cleanup']="$hookname ${_runhooks['cleanup']}"
+                ;;
+        esac
+    done
+}
+
+add_binary() {
+    # Add a binary file to the initcpio image. library dependencies will
+    # be discovered and added.
+    #   $1: path to binary
+    #   $2: destination on initcpio (optional, defaults to same as source)
+
+    local -a sodeps
+    local line= regex= binary= dest= mode= sodep= resolved=
+
+    if [[ ${1:0:1} != '/' ]]; then
+        binary=$(type -P "$1")
+    else
+        binary=$1
+    fi
+
+    if [[ ! -f $binary ]]; then
+        error "file not found: \`%s'" "$1"
+        return 1
+    fi
+
+    dest=${2:-$binary}
+    mode=$(stat -c %a "$binary")
+
+    # always add the binary itself
+    add_file "$binary" "$dest" "$mode"
+
+    # negate this so that the RETURN trap is not fired on non-binaries
+    ! lddout=$(ldd "$binary" 2>/dev/null) && return 0
+
+    # resolve sodeps
+    regex='^(|.+ )(/.+) \(0x[a-fA-F0-9]+\)'
+    while read -r line; do
+        if [[ $line =~ $regex ]]; then
+            sodep=${BASH_REMATCH[2]}
+        elif [[ $line = *'not found' ]]; then
+            error "binary dependency \`%s' not found for \`%s'" "${line%% *}" "$1"
+            (( ++_builderrors ))
+            continue
+        fi
+
+        if [[ -f $sodep && ! -e $BUILDROOT$sodep ]]; then
+            add_file "$sodep" "$sodep" "$(stat -Lc %a "$sodep")"
+        fi
+    done <<< "$lddout"
+
+    return 0
+}
+
+parse_config() {
+    # parse key global variables set by the config file.
+
+    map add_module "${MODULES[@]}"
+    map add_binary "${BINARIES[@]}"
+    map add_file "${FILES[@]}"
+
+    tee "$BUILDROOT/buildconfig" < "$1" | {
+        # When MODULES is not an array (but instead implicitly converted at
+        # startup), sourcing the config causes the string value of MODULES
+        # to be assigned as MODULES[0]. Avoid this by explicitly unsetting
+        # MODULES before re-sourcing the config.
+        unset MODULES
+
+        . /dev/stdin
+
+        # arrayize MODULES if necessary.
+        [[ ${MODULES@a} != *a* ]] && read -ra MODULES <<<"${MODULES//-/_}"
+
+        for mod in "${MODULES[@]%\?}"; do
+            mod=${mod//-/_}
+            # only add real modules (2 == builtin)
+            (( _addedmodules["$mod"] == 1 )) && add+=("$mod")
+        done
+        (( ${#add[*]} )) && printf 'MODULES="%s"\n' "${add[*]}"
+
+        printf '%s="%s"\n' \
+            'EARLYHOOKS' "${_runhooks['early']# }" \
+            'HOOKS' "${_runhooks['hooks']# }" \
+            'LATEHOOKS' "${_runhooks['late']# }" \
+            'CLEANUPHOOKS' "${_runhooks['cleanup']% }"
+    } >"$BUILDROOT/config"
+}
+
+initialize_buildroot() {
+    # creates a temporary directory for the buildroot and initialize it with a
+    # basic set of necessary directories and symlinks
+
+    local workdir= kernver=$1 arch=$(uname -m) buildroot
+
+    if ! workdir=$(mktemp -d --tmpdir mkinitcpio.XXXXXX); then
+        error 'Failed to create temporary working directory in %s' "${TMPDIR:-/tmp}"
+        return 1
+    fi
+    buildroot=${2:-$workdir/root}
+
+    if [[ ! -w ${2:-$workdir} ]]; then
+        error 'Unable to write to build root: %s' "$buildroot"
+        return 1
+    fi
+
+    # base directory structure
+    install -dm755 "$buildroot"/{new_root,proc,sys,dev,run,tmp,var,etc,usr/{local,lib,bin}}
+    ln -s "usr/lib" "$buildroot/lib"
+    ln -s "../lib"  "$buildroot/usr/local/lib"
+    ln -s "bin"     "$buildroot/usr/sbin"
+    ln -s "usr/bin" "$buildroot/bin"
+    ln -s "usr/bin" "$buildroot/sbin"
+    ln -s "../bin"  "$buildroot/usr/local/bin"
+    ln -s "../bin"  "$buildroot/usr/local/sbin"
+    ln -s "/run"    "$buildroot/var/run"
+
+    case $arch in
+        x86_64)
+            ln -s "lib"     "$buildroot/usr/lib64"
+            ln -s "usr/lib" "$buildroot/lib64"
+            ;;
+    esac
+
+    # mkinitcpio version stamp
+    printf '%s' "$version" >"$buildroot/VERSION"
+
+    # kernel module dir
+    [[ $kernver != none ]] && install -dm755 "$buildroot/usr/lib/modules/$kernver/kernel"
+
+    # mount tables
+    ln -s /proc/self/mounts "$buildroot/etc/mtab"
+    >"$buildroot/etc/fstab"
+
+    # indicate that this is an initramfs
+    >"$buildroot/etc/initrd-release"
+
+    # add a blank ld.so.conf to keep ldconfig happy
+    >"$buildroot/etc/ld.so.conf"
+
+    printf '%s' "$workdir"
+}
+
+run_build_hook() {
+    local hook=$1 script= resolved=
+    local MODULES=() BINARIES=() FILES=() SCRIPT=
+
+    # find script in install dirs
+    if ! script=$(PATH=$_d_install type -P "$hook"); then
+        error "Hook '$hook' cannot be found"
+        return 1
+    fi
+
+    # check for deprecation
+    if resolved=$(readlink -e "$script") && [[ ${script##*/} != "${resolved##*/}" ]]; then
+        warning "Hook '%s' is deprecated. Replace it with '%s' in your config" \
+            "${script##*/}" "${resolved##*/}"
+        script=$resolved
+    fi
+
+    # source
+    unset -f build
+    if ! . "$script"; then
+        error 'Failed to read %s' "$script"
+        return 1
+    fi
+
+    if ! declare -f build >/dev/null; then
+        error 'Hook '$script' has no build function'
+        return 1
+    fi
+
+    # run
+    if (( _optquiet )); then
+        msg2 "Running build hook: [%s]" "${script##*/}"
+    else
+        msg2 "Running build hook: [%s]" "$script"
+    fi
+    build
+
+    # if we made it this far, return successfully. Hooks can
+    # do their own error catching if it's severe enough, and
+    # we already capture errors from the add_* functions.
+    return 0
+}
+
 
 # 开始内核编译
 build_kernel()
@@ -493,6 +1046,133 @@ linux-config 当前版本：v$version
 EOF
 }
 
+process_preset() (
+    local preset=$1 preset_cli_options=$2 preset_image= preset_options=
+    local -a preset_mkopts preset_cmd
+    if (( MKINITCPIO_PROCESS_PRESET )); then
+        error "You appear to be calling a preset from a preset. This is a configuration error."
+        cleanup 1
+    fi
+
+    # allow path to preset file, else resolve it in $_d_presets
+    if [[ $preset != */* ]]; then
+        printf -v preset '%s/%s.preset' "$_d_presets" "$preset"
+    fi
+
+    . "$preset" || die "Failed to load preset: \`%s'" "$preset"
+
+    (( ! ${#PRESETS[@]} )) && warning "Preset file \`%s' is empty or does not contain any presets." "$preset"
+
+    # Use -m and -v options specified earlier
+    (( _optquiet )) || preset_mkopts+=(-v)
+    (( _optcolor )) || preset_mkopts+=(-n)
+
+    (( _optsavetree )) && preset_mkopts+=(-s)
+
+    ret=0
+    for p in "${PRESETS[@]}"; do
+        msg "Building image from preset: $preset: '$p'"
+        preset_cmd=("${preset_mkopts[@]}")
+
+        preset_kver=${p}_kver
+        if [[ ${!preset_kver:-$ALL_kver} ]]; then
+            preset_cmd+=(-k "${!preset_kver:-$ALL_kver}")
+        else
+            warning "No kernel version specified. Skipping image \`%s'" "$p"
+            continue
+        fi
+
+        preset_config=${p}_config
+        if [[ ${!preset_config:-$ALL_config} ]]; then
+            preset_cmd+=(-c "${!preset_config:-$ALL_config}")
+        else
+            warning "No configuration file specified. Skipping image \`%s'" "$p"
+            continue
+        fi
+
+        preset_image=${p}_image
+        if [[ ${!preset_image} ]]; then
+            preset_cmd+=(-g "${!preset_image}")
+        else
+            warning "No image file specified. Skipping image \`%s'" "$p"
+            continue
+        fi
+
+        preset_options=${p}_options
+        if [[ ${!preset_options} ]]; then
+            preset_cmd+=(${!preset_options}) # intentional word splitting
+        fi
+
+        preset_efi_image=${p}_efi_image
+        if [[ ${!preset_efi_image:-$ALL_efi_image} ]]; then
+            preset_cmd+=(-U "${!preset_efi_image:-$ALL_efi_image}")
+        fi
+
+        preset_microcode=${p}_microcode[@]
+        if [[ ${!preset_microcode:-$ALL_microcode} ]]; then
+            for mc in "${!preset_microcode:-${ALL_microcode[@]}}"; do
+                preset_cmd+=(--microcode "$mc")
+            done
+        fi
+
+        preset_cmd+=($OPTREST)
+        msg2 "${preset_cmd[*]}"
+        MKINITCPIO_PROCESS_PRESET=1 "$0" "${preset_cmd[@]}"
+        (( $? )) && ret=1
+    done
+
+    exit $ret
+)
+
+arrayize_config() {
+    set -f
+    [[ ${MODULES@a} != *a* ]] && MODULES=($MODULES)
+    [[ ${BINARIES@a} != *a* ]] && BINARIES=($BINARIES)
+    [[ ${FILES@a} != *a* ]] && FILES=($FILES)
+    [[ ${HOOKS@a} != *a* ]] && HOOKS=($HOOKS)
+    [[ ${COMPRESSION_OPTIONS@a} != *a* ]] && COMPRESSION_OPTIONS=($COMPRESSION_OPTIONS)
+    set +f
+}
+
+
+
+compute_hookset() {
+    local h
+
+    for h in "${HOOKS[@]}" "${_optaddhooks[@]}"; do
+        in_array "$h" "${_optskiphooks[@]}" && continue
+        _hooks+=("$h")
+    done
+}
+
+# 生成 initramfs 文件
+# @param kernel 版本
+gen_initramfs() {
+    # 生成临时文件
+    tmpfile=$(mktemp -t mkinitcpio.XXXXXX)
+    trap "rm $tmpfile" EXIT
+
+    [[ -e /proc/self/mountinfo ]] || _msg_error "/proc 没有挂载!" 1
+    [[ -e /dev/fd ]] || _msg_error "/dev 没有挂载!" 1
+
+    if (( ${#opt_preset[*]} )); then
+        map_process_preset "${opt_preset[@]}"
+        exit
+    fi
+
+    if [[ ! -d $module ]]; then
+        _msg_error "内核文件未生成!" 1
+    fi
+
+    arrayize_config
+
+    compute_hookset
+
+    if (( ${#_hooks[*]} == 0 )); then
+        _msg_error "配置错误, 没找到 hooks"
+    fi
+}
+
 # 列出 initramfs 文件内容
 # @param image 绝对路径
 list_initramfs() {
@@ -681,8 +1361,7 @@ while :; do
             exit 0
             ;;
         -r|--run)
-            main
-            cleanup $?
+            canrun=true
             ;;
         -v|--version)
             version
@@ -699,9 +1378,10 @@ while :; do
     esac
     shift
 done
-            
-usage
-cleanup 0
+
+# 编译内核并安装
+[[ $canrun ]] && main || usage
+
 ##### main 结束
 
 
