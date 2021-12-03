@@ -568,14 +568,14 @@ analyze_initramfs() {
     # print results
     imagename=$image
     [[ -L $image ]] && imagename+=" -> $(readlink -e "$image")"
-    _msg_info_pure "镜像路径: $imagename"
-    _msg_info_pure "内核: ${kernver:-'未知'}"
-    _msg_info_pure "大小: $(size_to_human "$zsize")"
+    _msg_info_pure "    镜像路径: $imagename"
+    _msg_info_pure "        内核: ${kernver:-'未知'}"
+    _msg_info_pure "        大小: $(size_to_human "$zsize")"
 
     if [[ $compress ]]; then
-        _msg_info_pure "压缩方式: ${compress:-'未压缩'}"
-        _msg_info_pure "未压缩大小: $(size_to_human \"$fullsize\") (压缩比率: $ratio)"
-        _msg_info_pure "解压缩时间: $decomptime"
+        _msg_info_pure "    压缩方式: ${compress:-'未压缩'}"
+        _msg_info_pure "  未压缩大小: $(size_to_human \"$fullsize\") (压缩比率: $ratio)"
+        _msg_info_pure "  解压缩时间: $decomptime"
     fi
     printf '\n'
 
