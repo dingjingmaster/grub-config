@@ -27,7 +27,6 @@ module="$out_dir/lib/modules/${kernel_version}"
 kernel="$out_dir/${kernel_name}"
 initramfs="$out_dir/${initramfs_name}"
 
-
 # 输出信息
 _msg_info() 
 {
@@ -189,7 +188,6 @@ parseopts()
                     OPTRET+=("-$opt")
                     # option requires optarg
                     if [[ $shortopts = *$opt:* ]]; then
-                        # if we're not at the end of the option chunk, the rest is the optarg
                         if (( i < ${#1} - 1 )); then
                             OPTRET+=("${1:i+1}")
                             break
@@ -259,23 +257,6 @@ parseopts()
     unset longoptmatch
 
     return 0
-}
-
-# 使用说明
-usage() 
-{
-    cat <<EOF
-linux-config 当前版本：v$version
-使用: ${0##*/} [配置选项]
-
-  配置选项:
-   -c, --config <config>        使用指定的内核编译配置 (默认: $work_dir/config)
-   -h, --help                   显示此帮助信息并退出
-   -v, --version                显示帮助信息并退出
-   -q, --quiet                  显示更少信息（编译过程中的日志打印不输出）
-   -k, --kernel <dir>           指定内核源码目录（默认：/data/source/kernel）
-
-EOF
 }
 
 # 更新 grub 配置
@@ -353,54 +334,77 @@ cleanup()
     exit "$err"
 }
 
+#####################
+# 获取镜像的压缩方式
+# @param 镜像路径
+#####################
+detect_file_type() {
+    local bytes
 
-trap 'cleanup 130' INT
-trap 'cleanup 143' TERM
-
-_opt_short='c:k:o:hvq'
-_opt_long=('config:' 'addhooks:' 'kernel:' 'hookdir' : 'hookhelp:' 'grubOutput:' 'help' 'version' 'quiet')
-
-parseopts "$_opt_short" "${_opt_long[@]}" -- "$@" || exit 1
-set -- "${OPTRET[@]}"
-unset _opt_short _opt_long OPTRET
-
-
-while :; do
-    case $1 in
-        -c|--config)
-            shift
-            _f_config=$1
+    read -rd '' bytes < <(hexdump -n 6 -e '"%c"' "$1")
+    case $bytes in
+        '070701')
+            # no compression
+            echo
+            return
             ;;
-        -q|--quiet)
-            quiet=y
-            ;;
-        -o|--grubOutput)
-            grubp="$1"
-            if [[ x"$grubp" =~ ^x"/*" ]]; then
-                grub_config="$1"
-            else
-                grub_config="${work_dir}/out/${append_date}/grub.cfg"
-            fi
-            ;;
-        -h|--help)
-            usage
-            cleanup 0
-            ;;
-        -v|--version)
-            version
-            cleanup 0
-            ;;
-        -k|--kernel)
-            shift
-            _f_kernel_source=$1
-            ;;
-        --)
-            shift
-            break 2
+        $'\xfd7zXZ')
+            echo 'xz'
+            return
             ;;
     esac
-    shift
-done
+
+    read -rd '' bytes < <(hexdump -n 4 -e '"%c"' "$1")
+    if [[ $bytes = $'\x89LZO' ]]; then
+        echo 'lzop'
+        return
+    fi
+
+    read -rd '' bytes < <(hexdump -n 2 -e '"%x"' "$1")
+    if [[ $bytes = '8b1f' ]]; then
+        echo 'gzip'
+        return
+    fi
+
+    read -rd '' bytes < <(hexdump -n 4 -e '"%x"' "$1")
+    case $bytes in
+        184d2204)
+            error 'Newer lz4 stream format detected! This may not boot!'
+            echo 'lz4'
+            return
+            ;;
+        184c2102)
+            echo 'lz4 -l'
+            return
+            ;;
+        fd2fb528)
+            echo 'zstd'
+            return
+            ;;
+    esac
+
+    read -rd '' bytes < <(hexdump -n 3 -e '"%c"' "$1")
+    if [[ $bytes == 'BZh' ]]; then
+        echo 'bzip2'
+        return
+    fi
+
+    # lzma detection sucks and there's really no good way to
+    # do it without reading large portions of the stream. this
+    # check is good enough for GNU tar, apparently, so it's good
+    # enough for me.
+    read -rd '' bytes < <(hexdump -n 3 -e '"%x"' "$1")
+    if [[ $bytes = '5d' ]]; then
+        echo 'lzma'
+        return
+    fi
+
+    if kver "$1" >/dev/null; then
+        _msg_error "\"$1\" 是内核文件, 不是 initramfs 文件!" 1
+    fi
+
+    _msg_error "未知的文件格式, 你确定 \"$1\" 是一个 initramfs 文件?" 1
+}
 
 # 检查环境
 check_env()
@@ -442,27 +446,121 @@ check_env()
     cd $OLDPWD
 }
 
+# 使用说明
+usage() 
+{
+    cat <<EOF
+linux-config 当前版本：v$version
+使用: ${0##*/} [配置选项]
 
+  配置选项:
+   -c, --config <config>        使用指定的内核编译配置 (默认: $work_dir/config)
+   -k, --kernel <dir>           指定内核源码目录（默认：/data/source/kernel）
+   -l, --list <initramfs>       显示指定 initramfs 里的内容
+   -v, --version                显示帮助信息并退出
+   -r, --run                    开始生成内核文件并安装
+   -q, --quiet                  显示更少信息（编译过程中的日志打印不输出）
+   -h, --help                   显示此帮助信息并退出
+
+EOF
+}
+
+# 列出 initramfs 文件内容
+list_initramfs() {
+    img=
+    if [ ${1:0:1} = "/" ]; then
+        img="$1"
+    else
+        img="/boot/$1"
+    fi
+
+    if [ ! -f "$img" ]; then
+        _msg_error "\"$img\" 文件不存在" 1
+    fi
+
+    compress=$(detect_file_type "${img}")
+
+    ${compress:-cat} ${compress:+-cd} "$img" | bsdcpio -i
+}
+
+main() {
+    _msg_info "开始检查脚本运行环境 ..."
+    check_env
+
+    _msg_info "接下来的操作需要提权 ..."
+
+    _msg_info "开始编译内核 ..."
+    build_kernel
+
+    _msg_info "将内核文件安装到指定位置 ..."
+    kernel_install
+
+    _msg_info "开始生成 initramfs ..."
+    gen_initramfs
+
+    _msg_info "开始更新 grub 配置文件 ..."
+    update_grub
+}
 
 
 ##### main 开始
-_msg_info "开始检查脚本运行环境 ..."
-check_env
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
 
-_msg_info "接下来的操作需要提权 ..."
+_opt_short='c:k:o:l:hvqr'
+_opt_long=('config:' 'addhooks:' 'kernel:' 'hookdir' : 'hookhelp:' 'grubOutput:' 'list:' 'help' 'version' 'quiet' 'run')
 
-_msg_info "开始编译内核 ..."
-build_kernel
+parseopts "$_opt_short" "${_opt_long[@]}" -- "$@" || exit 1
+set -- "${OPTRET[@]}"
+unset _opt_short _opt_long OPTRET
 
-_msg_info "将内核文件安装到指定位置 ..."
-kernel_install
-
-_msg_info "开始生成 initramfs ..."
-gen_initramfs
-
-_msg_info "开始更新 grub 配置文件 ..."
-update_grub
-
+while :; do
+    case $1 in
+        -c|--config)
+            shift
+            _f_config=$1
+            ;;
+        -l|--list)
+            shift
+            list_initramfs "$1"
+            ;;
+        -q|--quiet)
+            quiet=y
+            ;;
+        -o|--grubOutput)
+            grubp="$1"
+            if [[ x"$grubp" =~ ^x"/*" ]]; then
+                grub_config="$1"
+            else
+                grub_config="${work_dir}/out/${append_date}/grub.cfg"
+            fi
+            ;;
+        -h|--help)
+            usage
+            cleanup 0
+            ;;
+        -r|--run)
+            main
+            cleanup $?
+            ;;
+        -v|--version)
+            version
+            cleanup 0
+            ;;
+        -k|--kernel)
+            shift
+            _f_kernel_source=$1
+            ;;
+        --)
+            shift
+            break 2
+            ;;
+    esac
+    shift
+done
+            
+usage
+cleanup 0
 ##### main 结束
 
 
