@@ -42,7 +42,12 @@ _msg_info()
 _msg_info_pure() 
 {
     local _msg="${1}"
-    printf '\033[32m%s\033[0m\n' "${_msg}" 
+    local f="${2-x}"
+    if [ $f = 'x' ]; then
+        printf '\033[32m%s\033[0m\n' "${_msg}" 
+    else
+        printf '\033[32m%s\033[0m' "${_msg}" 
+    fi
 }
 
 # 输出警告
@@ -112,6 +117,28 @@ build_kernel()
     sudo make -j32 modules_install
 
     cd "$OLDPWD"
+}
+
+#
+size_to_human() {
+    awk -v size="$1" '
+    BEGIN {
+        suffix[1] = "B"
+        suffix[2] = "KiB"
+        suffix[3] = "MiB"
+        suffix[4] = "GiB"
+        suffix[5] = "TiB"
+        count = 1
+
+        while (size > 1024) {
+            size /= 1024
+            count++
+        }
+
+        sizestr = sprintf("%.2f", size)
+        sub(/\.?0+$/, "", sizestr)
+        printf("%s %s", sizestr, suffix[count])
+    }'
 }
 
 gen_initramfs()
@@ -456,6 +483,7 @@ linux-config 当前版本：v$version
   配置选项:
    -c, --config <config>        使用指定的内核编译配置 (默认: $work_dir/config)
    -k, --kernel <dir>           指定内核源码目录（默认：/data/source/kernel）
+   -a, --analyze <initramfs>    分析 initramfs 里的内容
    -l, --list <initramfs>       显示指定 initramfs 里的内容
    -v, --version                显示帮助信息并退出
    -r, --run                    开始生成内核文件并安装
@@ -466,6 +494,7 @@ EOF
 }
 
 # 列出 initramfs 文件内容
+# @param image 绝对路径
 list_initramfs() {
     img=
     if [ ${1:0:1} = "/" ]; then
@@ -481,6 +510,112 @@ list_initramfs() {
     compress=$(detect_file_type "${img}")
 
     ${compress:-cat} ${compress:+-cd} "$img" | bsdcpio --list
+}
+
+# 分析 initramfs 文件内容
+# @param image 绝对路径
+analyze_initramfs() {
+    image=
+    if [ ${1:0:1} = "/" ]; then
+        image="$1"
+    else
+        image="/boot/$1"
+    fi
+
+    if [ ! -f "$image" ]; then
+        _msg_error "\"$image\" 文件不存在" 1
+    fi
+
+    local -a binaries explicitmod modules foundhooks hooks
+    local kernver ratio columns=$(tput cols) 
+
+    workdir=$(mktemp -d --tmpdir lsinitcpio.XXXXXX)
+    trap 'rm -rf "$workdir"' EXIT
+
+    compress=$(detect_file_type "${image}")
+
+    columns=${columns:-80}
+
+    zsize=$(wc -c <"$image")
+
+    if [[ $compress ]]; then
+        decomptime=$(TIMEFORMAT=%R; { time ${compress:-cat} ${compress:+-cd} "$image" >/dev/null; } 2>&1)
+        fullsize=$(${compress:-cat} ${compress:+-cd} "$image" | wc -c)
+        ratio=.$(( zsize * 1000 / fullsize % 1000 ))
+    fi
+
+    ${compress:-cat} ${compress:+-cd} "$image" | bsdtar -C "$workdir" -xf - || _msg_error '解压缩镜像失败' 1
+
+    modules=("$workdir/usr/lib/modules"/*/kernel/*.ko*)
+    if [[ -f ${modules[0]} ]]; then
+        IFS=/ read -r _ _ _ kernver _ <<<"${modules[0]#$workdir/}"
+        modules=("${modules[@]##*/}")
+        modules=("${modules[@]%.ko*}")
+    else
+        unset modules
+    fi
+
+    foundhooks=("$workdir"/hooks/*)
+    [[ -f ${foundhooks[0]} ]] && foundhooks=("${foundhooks[@]##*/}") || unset foundhooks
+
+    mapfile -t binaries < <(find "$workdir/usr/bin" -type f -printf %f\\n)
+
+    # shellcheck disable=SC1090
+    . "$workdir/config"
+
+    explicitmod=($modules)
+
+    # print results
+    imagename=$image
+    [[ -L $image ]] && imagename+=" -> $(readlink -e "$image")"
+    _msg_info_pure "镜像路径: $imagename"
+    _msg_info_pure "内核: ${kernver:-'未知'}"
+    _msg_info_pure "大小: $(size_to_human "$zsize")"
+
+    if [[ $compress ]]; then
+        _msg_info_pure "压缩方式: ${compress:-'未压缩'}"
+        _msg_info_pure "未压缩大小: $(size_to_human \"$fullsize\") (压缩比率: $ratio)"
+        _msg_info_pure "解压缩时间: $decomptime"
+    fi
+    printf '\n'
+
+    if (( ${#modules[*]} )); then
+        _msg_info_pure "包含的模块:"
+        for mod in "${modules[@]}"; do
+            printf '  %s' "$mod"
+            #in_array "${mod//_/-}" "${explicitmod[@]//_/-}" && printf ' [explicit]'
+            printf '\n'
+        done | sort | column -c$columns
+        printf '\n'
+    fi
+
+    _msg_info_pure '包含的命令:'
+    printf '  %s\n' "${binaries[@]}" | sort | column -c$columns
+    printf '\n'
+
+    if [[ $EARLYHOOKS ]]; then
+        _msg_info_pure 'Early hook run order:'
+        printf '  %s\n' $EARLYHOOKS
+        printf '\n'
+    fi
+
+    if [[ $HOOKS ]]; then
+        _msg_info_pure 'Hook run order:'
+        printf '  %s\n' $HOOKS
+        printf '\n'
+    fi
+
+    if [[ $LATEHOOKS ]]; then
+        _msg_info_pure 'Late hook run order:'
+        printf '  %s\n' $LATEHOOKS
+        printf '\n'
+    fi
+
+    if [[ $CLEANUPHOOKS ]]; then
+        _msg_info_pure 'Cleanup hook run order:'
+        printf '  %s\n' $CLEANUPHOOKS
+        printf '\n'
+    fi
 }
 
 main() {
@@ -507,8 +642,8 @@ main() {
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
 
-_opt_short='c:k:o:l:hvqr'
-_opt_long=('config:' 'addhooks:' 'kernel:' 'hookdir' : 'hookhelp:' 'grubOutput:' 'list:' 'help' 'version' 'quiet' 'run')
+_opt_short='c:k:o:l:a:hvqr'
+_opt_long=('config:' 'addhooks:' 'kernel:' 'hookdir' : 'hookhelp:' 'grubOutput:' 'list:' 'analyze:' 'help' 'version' 'quiet' 'run')
 
 parseopts "$_opt_short" "${_opt_long[@]}" -- "$@" || exit 1
 set -- "${OPTRET[@]}"
@@ -523,6 +658,11 @@ while :; do
         -l|--list)
             shift
             list_initramfs "$1"
+            exit 0
+            ;;
+        -a|--analyze)
+            shift
+            analyze_initramfs "$1"
             exit 0
             ;;
         -q|--quiet)
