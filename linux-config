@@ -6,6 +6,17 @@ declare -r version=1
 
 export LOCALVERSION="-GracefulLinux"
 
+####### initramfs 配置开始
+# 在 boot hooks 之前添加的内核模块
+initramfs_modules=()                                                      
+
+# 添加一些命令到 initramfs 内部
+BINARIES=()                                                     
+FILES=()
+HOOKS=(base udev autodetect modconf block filesystems keyboard fsck)
+####### initramfs 配置结束
+
+
 # 常用变量
 work_dir=$(dirname $(realpath -- $0))
 
@@ -27,6 +38,8 @@ module="$out_dir/lib/modules/${kernel_version}"
 kernel="$out_dir/${kernel_name}"
 initramfs="$out_dir/${initramfs_name}"
 canrun=
+opt_preset=()
+
 
 # 输出信息
 _msg_info() 
@@ -694,16 +707,16 @@ size_to_human() {
     }'
 }
 
-gen_initramfs()
-{
-    if [ ! -f "$kernel" ]; then
-        _msg_error "内核文件 '$kernel' 没有正确生成" -1
-    fi
-
-    _msg_info "mkinitcpio -r ${out_dir} -k ${kernel_version} -g ${initramfs}"
-    mkinitcpio -k "${kernel_version}" -g "${initramfs}"
-    sudo cp "${initramfs}" "/boot/"
-}
+#gen_initramfs()
+#{
+#    if [ ! -f "$kernel" ]; then
+#        _msg_error "内核文件 '$kernel' 没有正确生成" -1
+#    fi
+#
+#    _msg_info "mkinitcpio -r ${out_dir} -k ${kernel_version} -g ${initramfs}"
+#    mkinitcpio -k "${kernel_version}" -g "${initramfs}"
+#    sudo cp "${initramfs}" "/boot/"
+#}
 
 # 解析参数
 parseopts() 
@@ -900,16 +913,6 @@ EOF
 cleanup()
 {
     local err=${1:-$?}
-
-    #if [[ $_d_workdir ]]; then
-    #    # when _optpreset is set, we're in the main loop, not a worker process
-    #    if (( _optsavetree )) && [[ -z ${_optpreset[*]} ]]; then
-    #        printf '%s\n' "${!_autodetect_cache[@]}" > "$_d_workdir/autodetect_modules"
-    #        msg "build directory saved in %s" "$_d_workdir"
-    #    else
-    #        rm -rf "$_d_workdir"
-    #    fi
-    #fi
 
     exit "$err"
 }
@@ -1126,7 +1129,7 @@ process_preset() (
 
 arrayize_config() {
     set -f
-    [[ ${MODULES@a} != *a* ]] && MODULES=($MODULES)
+    [[ ${initramfs_modules@a} != *a* ]] && initramfs_modules=($initramfs_modules)
     [[ ${BINARIES@a} != *a* ]] && BINARIES=($BINARIES)
     [[ ${FILES@a} != *a* ]] && FILES=($FILES)
     [[ ${HOOKS@a} != *a* ]] && HOOKS=($HOOKS)
@@ -1148,7 +1151,7 @@ compute_hookset() {
 # 生成 initramfs 文件
 # @param kernel 版本
 gen_initramfs() {
-    # 生成临时文件
+    # 生成临时文件 image
     tmpfile=$(mktemp -t mkinitcpio.XXXXXX)
     trap "rm $tmpfile" EXIT
 
@@ -1156,7 +1159,7 @@ gen_initramfs() {
     [[ -e /dev/fd ]] || _msg_error "/dev 没有挂载!" 1
 
     if (( ${#opt_preset[*]} )); then
-        map_process_preset "${opt_preset[@]}"
+        map process_preset "${opt_preset[@]}"
         exit
     fi
 
@@ -1302,11 +1305,10 @@ main() {
     _msg_info "开始检查脚本运行环境 ..."
     check_env
 
-    _msg_info "接下来的操作需要提权 ..."
-
     _msg_info "开始编译内核 ..."
     build_kernel
 
+    _msg_info "接下来的操作需要提权 ..."
     _msg_info "将内核文件安装到指定位置 ..."
     kernel_install
 
@@ -1378,6 +1380,11 @@ while :; do
     esac
     shift
 done
+
+kernel_version="5.16.0-rc2-GracefulLinux"
+module="/lib/modules/5.16.0-rc2-GracefulLinux"
+
+gen_initramfs
 
 # 编译内核并安装
 [[ $canrun ]] && main || usage
